@@ -50,27 +50,30 @@ defmodule Mnesiac.StoreManager do
   Copy tables
   """
   def copy_tables(cluster_node) do
-    local_cookies = get_table_cookies()
-    remote_cookies = get_table_cookies(cluster_node)
+    with {:ok, local_cookies} <- get_table_cookies(),
+         {:ok, remote_cookies} <- get_table_cookies(cluster_node) do
+      Enum.each(stores(), fn data_mapper ->
+        case {local_cookies[data_mapper], remote_cookies[data_mapper]} do
+          {nil, nil} ->
+            apply(data_mapper, :init_store, [])
 
-    Enum.each(stores(), fn data_mapper ->
-      case {local_cookies[data_mapper], remote_cookies[data_mapper]} do
-        {nil, nil} ->
-          apply(data_mapper, :init_store, [])
+          {nil, _} ->
+            apply(data_mapper, :copy_store, [])
 
-        {nil, _} ->
-          apply(data_mapper, :copy_store, [])
+          {_, nil} ->
+            Logger.info("[mnesiac:#{node()}] #{inspect(data_mapper)}: no remote data to copy found.")
+            {:error, :no_remote_data_to_copy}
 
-        {_, nil} ->
-          Logger.info("[mnesiac:#{node()}] #{inspect(data_mapper)}: no remote data to copy found.")
-          {:error, :no_remote_data_to_copy}
+          {_local, _remote} ->
+            apply(data_mapper, :resolve_conflict, [cluster_node])
+        end
+      end)
 
-        {_local, _remote} ->
-          apply(data_mapper, :resolve_conflict, [cluster_node])
-      end
-    end)
-
-    :ok
+      :ok
+    else
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   @doc """
@@ -123,10 +126,24 @@ defmodule Mnesiac.StoreManager do
   This function returns a map of tables and their cookies.
   """
   def get_table_cookies(node \\ node()) do
-    tables = :rpc.call(node, :mnesia, :system_info, [:tables])
+    case :rpc.call(node, :mnesia, :system_info, [:tables], 5000) do
+      {:badrpc, reason} ->
+        {:error, reason}
 
-    Enum.reduce(tables, %{}, fn t, acc ->
-      Map.put(acc, t, :rpc.call(node, :mnesia, :table_info, [t, :cookie]))
+      tables ->
+        get_table_cookies(node, tables)
+    end
+  end
+
+  defp get_table_cookies(node, tables) do
+    Enum.reduce_while(tables, {:ok, %{}}, fn t, {:ok, acc} ->
+      case :rpc.call(node, :mnesia, :table_info, [t, :cookie], 5000) do
+        {:badrpc, reason} ->
+          {:halt, {:error, reason}}
+
+        cookie ->
+          {:cont, {:ok, Map.put(acc, t, cookie)}}
+      end
     end)
   end
 end
